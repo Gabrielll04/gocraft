@@ -1,12 +1,32 @@
 package gocraft
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 )
+
+type PacketState int
+
+const (
+	Handshaking PacketState = iota
+	Status
+)
+
+type ServerboundPacket interface{}
+
+type Handshake struct {
+	ProtocolVersion int32
+	Address         string
+	Port            uint16
+	NextState       int32
+}
+
+type Request struct{}
+type Ping struct{ Payload int64 }
 
 func ReadVarInt(r io.Reader) (int32, error) {
 	var numRead int
@@ -55,7 +75,20 @@ func WriteVarInt(w io.Writer, value int32) error {
 	}
 }
 
+func ReadString(r io.Reader) (string, error) {
+	length, err := ReadVarInt(r)
+	if err != nil {
+		return "", err
+	}
 
+	buf := make([]byte, length)
+	_, err = io.ReadFull(r, buf)
+	if err != nil {
+		return "", err
+	}
+
+	return string(buf), nil
+}
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
