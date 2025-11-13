@@ -16,11 +16,12 @@ type PacketState int
 const (
 	Handshaking PacketState = iota
 	Status
+	Login
+	Play
 )
 
 type ServerboundPacket interface{}
 
-// packets received from client
 type Handshake struct {
 	ProtocolVersion int32
 	Address         string
@@ -29,15 +30,21 @@ type Handshake struct {
 }
 
 type Request struct{}
+
 type Ping struct{ Payload int64 }
 
-
-
+type LoginStart struct {
+	Name string
+}
 
 type ClientboundPacket interface{}
 
-// packets to sent to the client
 type Pong struct{ Payload int64 }
+
+type LoginSuccess struct {
+	UUID     string
+	Username string
+}
 
 type Response struct {
 	Version     Version     `json:"version"`
@@ -83,14 +90,12 @@ func ReadVarInt(r io.Reader) (int32, error) {
 		byteVal := buf[0]
 		value := int32(byteVal & 0x7F)
 		result |= value << (7 * numRead)
-
 		numRead++
 
 		if (byteVal & 0x80) == 0 {
 			break
 		}
 	}
-
 	return result, nil
 }
 
@@ -105,7 +110,6 @@ func WriteVarInt(w io.Writer, value int32) error {
 		if _, err := w.Write([]byte{b}); err != nil {
 			return err
 		}
-
 		value >>= 7
 	}
 }
@@ -119,19 +123,27 @@ func ReadString(r io.Reader) (string, error) {
 	buf := make([]byte, length)
 	_, err = io.ReadFull(r, buf)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	return string(buf), nil
 }
 
 func ReadPacket(r io.Reader, state PacketState) (ServerboundPacket, error) {
-	_, err := ReadVarInt(r)
+	length, err := ReadVarInt(r)
 	if err != nil {
 		return nil, err
 	}
 
-	packetID, err := ReadVarInt(r)
+	packetData := make([]byte, length)
+	_, err = io.ReadFull(r, packetData)
+	if err != nil {
+		return nil, err
+	}
+
+	packetReader := bytes.NewReader(packetData)
+
+	packetID, err := ReadVarInt(packetReader)
 	if err != nil {
 		return nil, err
 	}
@@ -139,45 +151,52 @@ func ReadPacket(r io.Reader, state PacketState) (ServerboundPacket, error) {
 	switch state {
 	case Handshaking:
 		if packetID == 0x00 {
-			ProtocolVersion, err := ReadVarInt(r)
+			ProtocolVersion, err := ReadVarInt(packetReader)
 			if err != nil {
 				return nil, err
 			}
 
-			Address, err := ReadString(r)
+			Address, err := ReadString(packetReader)
 			if err != nil {
 				return nil, err
 			}
 
 			var port uint16
-			if err := binary.Read(r, binary.BigEndian, &port); err != nil {
+			if err := binary.Read(packetReader, binary.BigEndian, &port); err != nil {
 				return nil, err
 			}
 
-			NextState, err := ReadVarInt(r)
+			NextState, err := ReadVarInt(packetReader)
 			if err != nil {
 				return nil, err
 			}
 
 			return Handshake{
 				ProtocolVersion: ProtocolVersion,
-				Address: 	     Address,
+				Address:         Address,
 				Port:            port,
 				NextState:       NextState,
 			}, nil
 		}
-	
 	case Status:
 		switch packetID {
 		case 0x00:
 			return Request{}, nil
-
 		case 0x01:
 			var payload int64
-			if err := binary.Read(r, binary.BigEndian, &payload); err != nil {
+			if err := binary.Read(packetReader, binary.BigEndian, &payload); err != nil {
 				return nil, err
 			}
 			return Ping{Payload: payload}, nil
+		}
+	case Login:
+		switch packetID {
+		case 0x00:
+			name, err := ReadString(packetReader)
+			if err != nil {
+				return nil, err
+			}
+			return LoginStart{Name: name}, nil
 		}
 	}
 
@@ -187,7 +206,7 @@ func ReadPacket(r io.Reader, state PacketState) (ServerboundPacket, error) {
 func handlePacket(packet ServerboundPacket) (ClientboundPacket, bool) {
 	switch p := packet.(type) {
 	case Handshake:
-		if p.NextState == 1 { // gonna work on this later
+		if p.NextState == 1 {
 			return nil, false
 		}
 		return nil, false
@@ -208,7 +227,7 @@ var resp = Response{
 	Players: Players{
 		Max:    100,
 		Online: 0,
-		Sample: []Player{}, 
+		Sample: []Player{},
 	},
 	Description: Description{
 		Text: "Servidor GoCraft :)",
@@ -217,15 +236,32 @@ var resp = Response{
 
 func writePacketFields(packetId int32, packetData []byte) []byte {
 	var buf bytes.Buffer
+	var packet bytes.Buffer
 
-	length := int32(len(packetData) + 1)
-	WriteVarInt(&buf, length)
-	WriteVarInt(&buf, packetId)
-	buf.Write(packetData)
+	WriteVarInt(&packet, packetId)
+	packet.Write(packetData)
 
-	fmt.Println("writing ", packetId, " packet fields")
+	WriteVarInt(&buf, int32(packet.Len()))
+	buf.Write(packet.Bytes())
 
+	fmt.Println("Writing packet", packetId, "with length", packet.Len())
 	return buf.Bytes()
+}
+
+func WriteString(w io.Writer, s string) error {
+	if err := WriteVarInt(w, int32(len(s))); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte(s))
+	return err
+}
+
+func writeLoginSuccessPacketFields(uuid, username string) []byte {
+	var payload bytes.Buffer
+	WriteString(&payload, uuid)
+	WriteString(&payload, username)
+	WriteVarInt(&payload, 0)
+	return payload.Bytes()
 }
 
 func WritePacket(packet ClientboundPacket) ([]byte, error) {
@@ -237,27 +273,25 @@ func WritePacket(packet ClientboundPacket) ([]byte, error) {
 		}
 
 		var payload bytes.Buffer
-		if err := WriteVarInt(&payload, int32(len(encoded))); err != nil {
-			return nil, err
-		}
-		payload.Write(encoded)
-
+		WriteString(&payload, string(encoded))
 		return writePacketFields(0x00, payload.Bytes()), nil
 
 	case Pong:
 		var payload bytes.Buffer
-
 		binary.Write(&payload, binary.BigEndian, p.Payload)
 		return writePacketFields(0x01, payload.Bytes()), nil
 
-	default: 
+	case LoginSuccess:
+		payload := writeLoginSuccessPacketFields("00000000-0000-0000-0000-000000000000", p.Username)
+		return writePacketFields(0x02, payload), nil
+
+	default:
 		return nil, fmt.Errorf("unknown packet type: %T", p)
 	}
 }
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-
 	fmt.Println("New connection:", conn.RemoteAddr())
 
 	state := Handshaking
@@ -265,7 +299,11 @@ func handleConnection(conn net.Conn) {
 	for {
 		packet, err := ReadPacket(conn, state)
 		if err != nil {
-			fmt.Println("An error occurred while reading the packet:", err)
+			if err != io.EOF {
+				fmt.Println("An error occurred while reading the packet:", err)
+			} else {
+				fmt.Println("Connection closed by client")
+			}
 			return
 		}
 
@@ -273,12 +311,41 @@ func handleConnection(conn net.Conn) {
 
 		switch p := packet.(type) {
 		case Handshake:
-			if p.NextState == 1 {
+			switch p.NextState {
+			case 1:
 				state = Status
-			} else {
+			case 2:
+				state = Login
+			default:
 				fmt.Println("Unsupported next state:", p.NextState)
 				return
 			}
+
+		case LoginStart:
+			fmt.Println("Player logging in:", p.Name)
+
+			loginSuccess := LoginSuccess{
+				UUID:     "00000000-0000-0000-0000-000000000000",
+				Username: p.Name,
+			}
+
+			data, err := WritePacket(loginSuccess)
+			if err != nil {
+				fmt.Println("Error creating login success packet:", err)
+				return
+			}
+
+			_, err = conn.Write(data)
+			if err != nil {
+				fmt.Println("Error sending login success packet:", err)
+				return
+			}
+
+			fmt.Println("Sent LoginSuccess to", p.Name)
+			state = Play
+
+			fmt.Println("Login completed, but Play state not fully implemented yet")
+			return
 
 		default:
 			resp, ok := handlePacket(packet)
